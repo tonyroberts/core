@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 from enum import Enum
 from functools import partialmethod, wraps
 import logging
@@ -69,31 +70,55 @@ def parse_and_log_command(channel, tsn, command_id, args):
     return cmd
 
 
-def decorate_command(channel, command):
+def decorate_command(
+    channel, command, retry=5, delayms=10, jitter=0.1, backoff=0.1
+):
     """Wrap a cluster command to make it safe."""
 
     @wraps(command)
     async def wrapper(*args, **kwds):
-        try:
-            result = await command(*args, **kwds)
-            channel.debug(
-                "executed '%s' command with args: '%s' kwargs: '%s' result: %s",
-                command.__name__,
-                args,
-                kwds,
-                result,
-            )
-            return result
+        retries_left = retry
+        retry_delayms = delayms
+        if delayms and jitter:
+            retry_delayms += random.uniform(0, delayms * jitter)
 
-        except (zigpy.exceptions.ZigbeeException, asyncio.TimeoutError) as ex:
-            channel.debug(
-                "command failed: '%s' args: '%s' kwargs '%s' exception: '%s'",
-                command.__name__,
-                args,
-                kwds,
-                str(ex),
-            )
-            return ex
+        while True:
+            try:
+                result = await command(*args, **kwds)
+                channel.debug(
+                    "executed '%s' command with args: '%s' kwargs: '%s' result: %s",
+                    command.__name__,
+                    args,
+                    kwds,
+                    result,
+                )
+                return result
+
+            except (zigpy.exceptions.ZigbeeException, asyncio.TimeoutError) as ex:
+                if retries_left > 0:
+                    retries_left -= 1
+                    channel.warning(
+                        "retrying command in %sms: '%s' args: '%s' kwargs '%s' exception: '%s'",
+                        retry_delayms,
+                        command.__name__,
+                        args,
+                        kwds,
+                        str(ex),
+                    )
+                    if retry_delayms:
+                        await asyncio.sleep(retry_delayms / 1000)
+                        if backoff:
+                            retry_delayms *= 1 + backoff
+                    continue
+
+                channel.error(
+                    "command failed: '%s' args: '%s' kwargs '%s' exception: '%s'",
+                    command.__name__,
+                    args,
+                    kwds,
+                    str(ex),
+                )
+                return ex
 
     return wrapper
 
